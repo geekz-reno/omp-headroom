@@ -11,6 +11,22 @@ export interface CommandCompletion extends HeadroomSubcommand {
 }
 
 export const SUBCOMMANDS: readonly HeadroomSubcommand[] = [
+  {
+    label: "doctor",
+    description: "Verify proxy readiness, compression metrics, and CCR retrieval",
+  },
+  {
+    label: "telemetry",
+    description: "Show net savings estimates, latency, rejections, and prompt-cache traffic",
+  },
+  {
+    label: "archives",
+    description: "List archive ownership and preview selective session cleanup",
+  },
+  {
+    label: "rollback",
+    description: "Restore and verify package versions from the previous update",
+  },
   { label: "stats", description: "Show compression stats (proxy, archive, CCR)" },
   { label: "on", description: "Enable Headroom for this session" },
   { label: "off", description: "Disable Headroom for this session" },
@@ -48,6 +64,22 @@ export function completeHeadroomCommand(
   const normalized = String(prefix || "")
     .trim()
     .toLowerCase();
+  if (normalized === "archives" || normalized.startsWith("archives ")) {
+    const suffix = normalized.slice("archives".length).trim();
+    const options = [
+      {
+        value: "archives list",
+        label: "list",
+        description: "Show per-session archive files and disk use",
+      },
+      {
+        value: "archives clear ",
+        label: "clear",
+        description: "Preview deletion for a selected session ID",
+      },
+    ].filter((option) => option.label.startsWith(suffix));
+    return options.length ? options : null;
+  }
   if (normalized.startsWith("clear")) {
     const options = [
       {

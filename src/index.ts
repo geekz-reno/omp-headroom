@@ -7,6 +7,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -15,6 +16,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { deleteArchiveSession, listArchiveInventory } from "./archive-admin.ts";
 import { clearArchiveTotals, readArchiveTotals, writeArchiveTotals } from "./archive-stats.ts";
 import {
   ccrFallbackPath,
@@ -95,8 +97,16 @@ import {
   type SessionArchiveCandidate,
 } from "./session-archive.ts";
 import { createHeadroomState, readForeignTotals, shared, subagentSessionIds } from "./state.ts";
-import { retrieveViaProxy, stringifyRetrieveResult } from "./tools.ts";
+import {
+  createCompressionTelemetry,
+  recordCompressionAttempt,
+  recordRetrievalCost,
+  telemetrySummary,
+} from "./telemetry.ts";
+import { paginateRetrieveResult, retrieveViaProxy, stringifyRetrieveResult } from "./tools.ts";
 import type { HeadroomCtx, HeadroomState } from "./types.ts";
+import { isUpdateGateBlocked, setUpdateGateBlocked } from "./update-gate.ts";
+import { checkProxyCapabilities, runVerifiedUpdate } from "./update-safety.ts";
 import {
   asNumber,
   clip,
@@ -481,7 +491,108 @@ function maintainInstall(ctx, state, force = false) {
   return maintenanceInFlight;
 }
 
-async function doMaintainInstall(ctx, state, force) {
+const ROLLBACK_SNAPSHOT_FILE = join(VENV_DIR, "..", ".headroom-rollback.json");
+let sharedCompatibilityBlocked = false;
+
+function setCompatibilityBlocked(state, blocked: boolean): void {
+  sharedCompatibilityBlocked = blocked;
+  state.compatibilityBlocked = blocked;
+  setUpdateGateBlocked(blocked);
+}
+
+function compressionIsPaused(): boolean {
+  return sharedCompatibilityBlocked || isUpdateGateBlocked();
+}
+
+async function installedPackages(): Promise<Record<string, string>> {
+  const result = await run(
+    VENV_PYTHON,
+    [
+      "-c",
+      "import json;from importlib.metadata import distributions;print(json.dumps({d.metadata['Name'].lower().replace('_','-'):d.version for d in distributions() if d.metadata['Name']}))",
+    ],
+    15_000,
+  );
+  if (result.code !== 0)
+    throw new Error("Cannot read installed Python package versions; update was not started.");
+  const packages: unknown = JSON.parse(result.out);
+  if (
+    !isRecord(packages) ||
+    Object.entries(packages).some(
+      ([name, version]) =>
+        !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) ||
+        typeof version !== "string" ||
+        !/^[a-zA-Z0-9.+!_-]+$/.test(version),
+    )
+  )
+    throw new Error("Invalid Python package snapshot.");
+  return packages as Record<string, string>;
+}
+
+interface InstallationSnapshot {
+  version: string;
+  packages: Record<string, string>;
+  createdAt: number;
+}
+
+async function captureInstallationSnapshot(): Promise<InstallationSnapshot> {
+  const packages = await installedPackages();
+  if (!packages["headroom-ai"])
+    throw new Error("Headroom distribution is missing from the environment snapshot.");
+  const snapshot = { packages, version: packages["headroom-ai"], createdAt: Date.now() };
+  const tmp = `${ROLLBACK_SNAPSHOT_FILE}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(snapshot), { mode: 0o600 });
+    renameSync(tmp, ROLLBACK_SNAPSHOT_FILE);
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch {}
+  }
+  return snapshot;
+}
+
+async function restoreInstallationSnapshot(snapshot: InstallationSnapshot): Promise<void> {
+  if (
+    !isRecord(snapshot) ||
+    !isRecord(snapshot.packages) ||
+    typeof snapshot.version !== "string" ||
+    snapshot.packages["headroom-ai"] !== snapshot.version
+  )
+    throw new Error("Invalid rollback snapshot.");
+  const current = await installedPackages();
+  const pins: string[] = [];
+  for (const [name, version] of Object.entries(snapshot.packages)) {
+    if (
+      !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) ||
+      typeof version !== "string" ||
+      !/^[a-zA-Z0-9.+!_-]+$/.test(version)
+    )
+      throw new Error("Invalid rollback package pin.");
+    if (current[name] !== version) pins.push(`${name}==${version}`);
+  }
+  if (pins.length) {
+    const args = ["--force-reinstall", "--no-deps", ...pins];
+    if (pins.some((pin) => pin.startsWith("torch") && pin.includes("+rocm")))
+      args.push("--extra-index-url", ROCM_TORCH_INDEX);
+    const restored = await installPythonPackages(args, 1_800_000);
+    if (restored.code !== 0)
+      throw new Error(`Package rollback failed: ${clip(restored.err.trim(), 300)}`);
+  }
+  const restored = await installedPackages();
+  if (Object.entries(snapshot.packages).some(([name, version]) => restored[name] !== version))
+    throw new Error("Rollback did not restore every recorded package version.");
+}
+
+async function ownsUpdateTarget(state): Promise<boolean> {
+  const url = new URL(PROXY_URL);
+  return (
+    ["127.0.0.1", "localhost", "::1", "[::1]"].includes(url.hostname) &&
+    Boolean(state.proxyProcess || (await systemdExecStartMatches()))
+  );
+}
+
+export async function doMaintainInstall(ctx, state, force) {
   try {
     if (!existsSync(HEADROOM_BIN)) {
       if (!acquireUpdateLock()) return;
@@ -533,24 +644,66 @@ async function doMaintainInstall(ctx, state, force) {
     }
     if (!isNewer(state.latest, state.version)) return;
 
+    if (!(await ownsUpdateTarget(state))) {
+      state.lastError =
+        "Update requires a loopback proxy owned by this extension or its configured service. No packages were changed; update through the proxy's owner.";
+      return;
+    }
+
     if (!acquireUpdateLock()) return;
     try {
       const wasRocm = (await isRocmVenv()) || detectAmdGpu();
       state.installState = "updating";
       renderWidget(ctx, state);
-      const upgrade = await installPythonPackages(["--upgrade", PACKAGE_SPEC], 1_800_000);
-      if (upgrade.code !== 0)
-        throw new Error(`headroom update failed: ${clip(upgrade.err.trim(), 300)}`);
-      state.installState = "";
+      let upgradeStarted = false;
+      const outcome = await runVerifiedUpdate({
+        snapshot: captureInstallationSnapshot,
+        upgrade: async () => {
+          upgradeStarted = true;
+          setCompatibilityBlocked(state, true);
+          const upgrade = await installPythonPackages(["--upgrade", PACKAGE_SPEC], 1_800_000);
+          if (upgrade.code !== 0)
+            throw new Error(`headroom update failed: ${clip(upgrade.err.trim(), 300)}`);
+          if (wasRocm) await repinRocmTorch();
+        },
+        verify: async () => {
+          if (!(await restartProxy(ctx, state)))
+            throw new Error("Updated proxy could not restart for verification.");
+          const capabilities = await checkProxyCapabilities(PROXY_URL, undefined, TOOL_TIMEOUT_MS);
+          state.capabilities = capabilities;
+          if (!capabilities.compatible)
+            throw new Error(
+              capabilities.checks
+                .filter((check) => !check.ok)
+                .map((check) => check.detail)
+                .join("; "),
+            );
+          return true;
+        },
+        rollback: restoreInstallationSnapshot,
+        recover: async () => {
+          if (!(await restartProxy(ctx, state)))
+            throw new Error("Restored packages, but the proxy could not restart.");
+          const capabilities = await checkProxyCapabilities(PROXY_URL, undefined, TOOL_TIMEOUT_MS);
+          state.capabilities = capabilities;
+          if (!capabilities.compatible)
+            throw new Error("Restored proxy did not pass compatibility checks.");
+          setCompatibilityBlocked(state, false);
+        },
+      });
       state.version = await installedVersion();
+      if (!outcome.updated) {
+        if (!upgradeStarted) throw new Error(outcome.error ?? "Update was not started.");
+        if (outcome.rolledBack) writeUpdateStamp({ checkedAt: Date.now(), latest: state.version });
+        throw new Error(
+          `${outcome.error}; ${outcome.rolledBack ? "previous package versions restored and verified" : `rollback incomplete: ${outcome.rollbackError ?? "no snapshot available"}`}`,
+        );
+      }
+      setCompatibilityBlocked(state, false);
       writeUpdateStamp({ checkedAt: Date.now(), latest: state.version });
-      if (wasRocm) await repinRocmTorch();
-      const restarted = await restartProxy(ctx, state);
       ctx?.ui?.notify?.(
-        restarted
-          ? `Headroom updated to ${state.version}; proxy restarted.`
-          : `Headroom updated to ${state.version}, but ${state.lastError || "the proxy restart is still pending."}`,
-        restarted ? "info" : "warn",
+        `Headroom updated to ${state.version}; compression and retrieval verified. Previous versions can be restored with /headroom rollback.`,
+        "info",
       );
     } finally {
       releaseUpdateLock();
@@ -559,6 +712,7 @@ async function doMaintainInstall(ctx, state, force) {
     state.installState = "";
     state.lastError = errorMessage(error);
   } finally {
+    state.installState = "";
     renderWidget(ctx, state);
   }
 }
@@ -858,6 +1012,7 @@ async function runHeadroomCompression(content, ctx, state) {
       ? await persistCcrOriginal(result, content, candidate, state, ctx)
       : 0;
   if (persisted) recordCompression(state, "tool", result, ctx);
+  else finishCompressionAttempt(state, result, false, "persistence");
   state.lastError = "";
   refreshStatsAndRender(ctx, state);
   return {
@@ -1001,15 +1156,31 @@ async function runHeadroomCompaction(ctx, state) {
 
 async function persistHolisticCompression(result, originalMessages, state, ctx) {
   if (!isBeneficialCompressionResult(result)) return false;
-  return (
+  const persisted =
     (await persistCcrOriginal(
       result,
       stableJson(originalMessages),
       stableJson(result.messages),
       state,
       ctx,
-    )) > 0
-  );
+    )) > 0;
+  if (!persisted) finishCompressionAttempt(state, result, false, "persistence");
+  return persisted;
+}
+
+const compressionAttempts = new WeakMap<object, { durationMs: number; settled: boolean }>();
+
+function finishCompressionAttempt(state, result, accepted: boolean, reason = "nonbeneficial") {
+  if (!state || !result) return;
+  const attempt = compressionAttempts.get(result);
+  if (!attempt || attempt.settled) return;
+  attempt.settled = true;
+  recordCompressionAttempt(state, {
+    durationMs: attempt.durationMs,
+    accepted,
+    tokensSaved: accepted ? result.tokensSaved : 0,
+    reason,
+  });
 }
 
 // Apply-gate + transform for OpenAI provider compression. Returns the original
@@ -1028,6 +1199,10 @@ async function compressOpenAiMessages(
   state,
   { targeted = false } = {},
 ) {
+  if (compressionIsPaused())
+    throw new Error(
+      "Headroom compression is paused during installation or until compatibility is verified.",
+    );
   // `targeted` = explicit single-tool-output compression: protect_recent 0 so
   // the tool content itself is eligible and analysis protection is disabled.
   // User messages are never eligible in either mode.
@@ -1035,6 +1210,9 @@ async function compressOpenAiMessages(
     messages,
     model,
     config: {
+      // Headroom 0.41+ defaults to marker-free compression. This client
+      // provides retrieval, so request markers and metrics that include them.
+      mode: "ccr",
       compress_user_messages: false,
       protect_recent: targeted ? 0 : 2,
       protect_analysis_context: !targeted,
@@ -1044,30 +1222,47 @@ async function compressOpenAiMessages(
   // Per-project routing: /p/<sessionId>/v1/compress lets the proxy track
   // stats per OMP session so multi-instance widgets don't mix data.
   const project = state?.sessionId ? `/p/${state.sessionId}` : "";
-  const response = await fetch(proxyPath(`${project}/v1/compress`), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Client": "omp",
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  const text = await response.text();
-  let data: Record<string, unknown>;
+  const started = performance.now();
   try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = { error: text };
+    const response = await fetch(proxyPath(`${project}/v1/compress`), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Client": "omp",
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await response.text();
+    let data: Record<string, unknown>;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { error: text };
+    }
+    if (!response.ok) {
+      const failure = data.error;
+      const message = isRecord(failure) ? failure.message : failure;
+      throw new Error(
+        `Headroom proxy compression failed (${response.status}): ${String(message ?? text ?? response.statusText)}`,
+      );
+    }
+    const result = normalizeCompressionResult(data, messages);
+    compressionAttempts.set(result, { durationMs: performance.now() - started, settled: false });
+    const tokenReduced = result.tokensBefore > 0 && result.tokensAfter < result.tokensBefore;
+    if (!isBeneficialCompressionResult(result)) {
+      finishCompressionAttempt(state, result, false, tokenReduced ? "nonbeneficial" : "metrics");
+    }
+    return result;
+  } catch (error) {
+    if (state)
+      recordCompressionAttempt(state, {
+        durationMs: performance.now() - started,
+        accepted: false,
+        reason: "error",
+      });
+    throw error;
   }
-  if (!response.ok) {
-    const failure = data.error;
-    const message = isRecord(failure) ? failure.message : failure;
-    throw new Error(
-      `Headroom proxy compression failed (${response.status}): ${String(message ?? text ?? response.statusText)}`,
-    );
-  }
-  return normalizeCompressionResult(data, messages);
 }
 
 function toOpenAiPayloadMessages(payload) {
@@ -1347,6 +1542,7 @@ async function compressAnthropicPayload(payload, ctx, state) {
           continue;
         }
       }
+      finishCompressionAttempt(state, result, false, "persistence");
       nextContent.push(block);
     }
     nextMessages.push(contentChanged ? { ...message, content: nextContent } : message);
@@ -1428,7 +1624,10 @@ async function compressResponsesBatch(entries, workingPayload, ctx, state) {
   const returnedTools = Array.isArray(result.messages)
     ? result.messages.filter((message) => isRecord(message) && message.role === "tool")
     : [];
-  if (returnedTools.length !== entries.length) return undefined;
+  if (returnedTools.length !== entries.length) {
+    finishCompressionAttempt(state, result, false, "unsupported");
+    return undefined;
+  }
   const changes: Array<{
     index: number;
     item: Record<string, unknown>;
@@ -1444,10 +1643,12 @@ async function compressResponsesBatch(entries, workingPayload, ctx, state) {
       returned.tool_call_id !== toolCalls[index].id ||
       typeof compressed !== "string"
     ) {
+      finishCompressionAttempt(state, result, false, "unsupported");
       return undefined;
     }
     if (compressed === entry.output) continue;
     if (compressed.length >= entry.output.length || !compressed.includes(COMPRESSED_MARKER)) {
+      finishCompressionAttempt(state, result, false, "missing-hash");
       return undefined;
     }
     changes.push({
@@ -1457,9 +1658,15 @@ async function compressResponsesBatch(entries, workingPayload, ctx, state) {
       compressedText: compressed,
     });
   }
-  if (changes.length === 0) return undefined;
+  if (changes.length === 0) {
+    finishCompressionAttempt(state, result, false, "nonbeneficial");
+    return undefined;
+  }
   const persisted = await persistCcrOriginalBatch(changes, state, ctx);
-  if (persisted !== changes.length) return undefined;
+  if (persisted !== changes.length) {
+    finishCompressionAttempt(state, result, false, "persistence");
+    return undefined;
+  }
   return { changes, result };
 }
 
@@ -1536,6 +1743,7 @@ export async function compressResponsesPayload(
       ) {
         return { item: { ...item, output: compressed }, result, output, compressed };
       }
+      finishCompressionAttempt(state, result, false, "nonbeneficial");
     } catch {
       // A failed item keeps its original output; other items still compress.
       _failures += 1;
@@ -1565,7 +1773,10 @@ export async function compressResponsesPayload(
       state,
       ctx,
     );
-    if (!persisted) continue;
+    if (!persisted) {
+      finishCompressionAttempt(state, entry.result, false, "persistence");
+      continue;
+    }
     nextInput[index] = entry.item;
     recordCompression(state, "provider", entry.result, ctx);
     changed = true;
@@ -1576,6 +1787,7 @@ export async function compressResponsesPayload(
 function recordCompression(state, kind, result, ctx) {
   const saved = Math.max(0, asNumber(result?.tokensSaved));
   if (saved <= 0) return;
+  finishCompressionAttempt(state, result, true);
   // hasUI=false → subagent or pre-initialize main. Use MODULE-LEVEL counters
   // (not state.foreignSelf*) because the factory creates a separate state per
   // call, but Bun caches the module — so _sharedForeign* is visible to both
@@ -1923,7 +2135,9 @@ export default function headroomExtension(pi: ExtensionAPI) {
     // gets its own stats bucket at /p/<sessionId>/stats so multi-instance
     // OMP sessions don't pollute each other's widget data.
     const sid = ctx?.sessionManager?.getSessionId?.();
+    const previousSession = state.sessionId;
     await prepareArchiveSession(ctx, state);
+    if (previousSession !== state.sessionId) state.telemetry = createCompressionTelemetry();
     // CRITICAL: only the main UI session (hasUI===true) may capture latestCtx.
     if (isMainSession(ctx)) {
       latestCtx = ctx;
@@ -2036,7 +2250,7 @@ export default function headroomExtension(pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_request", async (event, ctx) => {
-    if (!state.enabled) return;
+    if (!state.enabled || compressionIsPaused()) return;
     await prepareArchiveSession(ctx, state);
     ensureMainCaptured(ctx);
     // Main session: refresh subagent (+N) from foreign files on every provider
@@ -2231,38 +2445,62 @@ export default function headroomExtension(pi: ExtensionAPI) {
       description: RETRIEVE_DESCRIPTION,
       parameters: z.object({
         hash: z.string().describe("Hash key from a Headroom compression marker."),
-        query: z.string().optional().describe("Optional search query to filter original content."),
+        query: z
+          .string()
+          .max(1024)
+          .optional()
+          .describe("Optional literal, case-insensitive line filter."),
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Character offset in the original or filtered view; use next_offset for the next page.",
+          ),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(32000)
+          .optional()
+          .describe("Maximum returned characters; default 12000, maximum 32000."),
       }),
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        await ensureProxy(ctx, state, 5_000);
+        const started = performance.now();
         let data: Record<string, unknown>;
-        try {
-          const retrieved = await retrieveViaProxy(
-            PROXY_URL,
-            params.hash,
-            params.query,
-            signal,
-            TOOL_TIMEOUT_MS,
-          );
-          data = isRecord(retrieved) ? retrieved : { error: String(retrieved), hash: params.hash };
-        } catch (error) {
-          data = { error: errorMessage(error), hash: params.hash };
-        }
         let fallback = false;
-        if (data.error) {
+        try {
+          signal?.throwIfAborted();
           const sessionId = ctx?.sessionManager?.getSessionId?.() || state.sessionId;
           const original = await readCcrFallback(params.hash, undefined, sessionId);
           if (original !== undefined) {
             data = { original_content: original };
             fallback = true;
+          } else {
+            await ensureProxy(ctx, state, 1_000);
+            const retrieved = await retrieveViaProxy(
+              PROXY_URL,
+              params.hash,
+              undefined,
+              signal,
+              TOOL_TIMEOUT_MS,
+            );
+            data = isRecord(retrieved)
+              ? retrieved
+              : { error: String(retrieved), hash: params.hash };
           }
+        } catch (error) {
+          data = { error: errorMessage(error), hash: params.hash };
         }
-        state.ccrHashes += 1;
-        refreshStatsAndRender(ctx, state);
+        const page = paginateRetrieveResult(data, params);
+        const text = stringifyRetrieveResult(page, params.hash, fallback);
+        recordRetrievalCost(state, { chars: text.length, durationMs: performance.now() - started });
+        renderWidget(ctx, state);
         return {
-          content: [{ type: "text", text: stringifyRetrieveResult(data, params.hash, fallback) }],
-          isError: !!data.error,
-          details: data,
+          content: [{ type: "text", text }],
+          isError: !!page.error,
+          details: page,
         };
       },
     });
@@ -2276,6 +2514,16 @@ export default function headroomExtension(pi: ExtensionAPI) {
         content: z.string().describe("Text, JSON, logs, code, or search results to compress."),
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        if (compressionIsPaused())
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Compression paused after a failed compatibility check. Run /headroom doctor or /headroom rollback.",
+              },
+            ],
+            isError: true,
+          };
         const result = await runHeadroomCompression(params.content, ctx, state);
         return {
           content: [
@@ -2308,7 +2556,7 @@ export default function headroomExtension(pi: ExtensionAPI) {
   const UPDATE_AUTO_CLEAR_MS = 45_000;
   const headroomCommand = {
     description:
-      "Manage Headroom: stats, on, off, compact, clear, test, service, version, config, set, debug, start, stop, restart, update",
+      "Manage Headroom: stats, doctor, telemetry, archives, rollback, on, off, compact, clear, test, service, version, config, set, debug, start, stop, restart, update",
     getArgumentCompletions: (prefix) => completeHeadroomCommand(prefix, HEADROOM_TEST_SURFACES),
     handler: async (args, ctx) => {
       const parts = String(args || "")
@@ -2324,6 +2572,127 @@ export default function headroomExtension(pi: ExtensionAPI) {
       } else if (action === "off") {
         state.enabled = false;
         ctx.ui.notify("Headroom disabled for this session.", "info");
+      } else if (action === "doctor") {
+        if (existsSync(UPDATE_LOCK_FILE)) {
+          ctx.ui.notify(
+            "An installation operation is running. Run /headroom doctor after it finishes; compression remains paused.",
+            "warn",
+          );
+          return;
+        }
+        const capabilities = await checkProxyCapabilities(PROXY_URL, undefined, TOOL_TIMEOUT_MS);
+        state.capabilities = capabilities;
+        try {
+          setCompatibilityBlocked(state, !capabilities.compatible);
+        } catch (error) {
+          state.lastError = `Cannot persist compatibility status: ${errorMessage(error)}`;
+        }
+        const paused = compressionIsPaused();
+        if (!capabilities.compatible)
+          state.lastError =
+            "Compatibility check failed; compression paused. Run /headroom doctor after recovery.";
+        else if (!paused) state.lastError = "";
+        const settings = HEADROOM_SETTINGS.flatMap((setting) =>
+          invalidSettingValue(setting) === undefined
+            ? []
+            : [`WARN ${setting.key}: invalid value; using default.`],
+        );
+        ctx.ui.notify(
+          [
+            `Headroom doctor — ${PROXY_URL}`,
+            `Binary: ${existsSync(HEADROOM_BIN) ? "available" : "missing"} (${HEADROOM_BIN})`,
+            ...capabilities.checks.map(
+              (check) => `${check.ok ? "OK" : "FAIL"} ${check.name}: ${check.detail}`,
+            ),
+            ...settings,
+            capabilities.compatible && !paused
+              ? "Compression/retrieval contract verified using synthetic content."
+              : "Compression is paused. Fix the proxy, then rerun /headroom doctor or /headroom rollback.",
+          ].join("\n"),
+          capabilities.compatible && !paused ? "info" : "warn",
+        );
+      } else if (action === "telemetry") {
+        ctx.ui.notify(
+          telemetrySummary(state, state.cacheReadTokens, state.cacheWriteTokens),
+          "info",
+        );
+      } else if (action === "archives") {
+        try {
+          const inventory = await listArchiveInventory();
+          const current = safeSessionId(ctx?.sessionManager?.getSessionId?.());
+          if (parts[1] === "clear") {
+            const id = safeSessionId(parts[2]);
+            if (!id || parts.length > 4 || (parts[3] && parts[3] !== "confirm")) {
+              ctx.ui.notify("Usage: /headroom archives clear <sessionId> [confirm]", "warn");
+            } else if (id === current) {
+              ctx.ui.notify("Use /headroom clear session confirm for the active session.", "warn");
+            } else {
+              const target = inventory.sessions.find((session) => session.sessionId === id);
+              if (!target)
+                ctx.ui.notify("No owned archive directory found for that session.", "warn");
+              else if (parts[3] !== "confirm")
+                ctx.ui.notify(
+                  `This removes ${target.files} owned archive files (${target.bytes} bytes) for ${id}. Resuming that session may require those originals. Run /headroom archives clear ${id} confirm to delete them.`,
+                  "warn",
+                );
+              else {
+                const removed = await deleteArchiveSession(id);
+                const cleared = removed.cleared ? await clearArchiveTotals(id) : false;
+                ctx.ui.notify(
+                  `Removed ${removed.deletedFiles} archive files for ${id}; retained ${removed.retainedEntries} unknown entries. Archive counters ${cleared ? "cleared" : "retained"}.`,
+                  "info",
+                );
+              }
+            }
+          } else if (parts.length === 1 || sub === "list") {
+            ctx.ui.notify(
+              [
+                "Owned Headroom archives (bytes on disk)",
+                ...inventory.sessions.map(
+                  (session) =>
+                    `${session.sessionId}${session.sessionId === current ? " (current)" : ""}: ${session.files} files · ${session.bytes} bytes · modified ${new Date(session.modifiedAt).toISOString()} · ${session.retainedEntries} unknown entries`,
+                ),
+                `${inventory.legacyFiles} unowned legacy files (${inventory.legacyBytes} bytes) retained; ${inventory.retainedEntries} unknown entries retained.`,
+                "Selective cleanup: /headroom archives clear <sessionId> (preview), then append confirm.",
+              ].join("\n"),
+              "info",
+            );
+          } else
+            ctx.ui.notify("Usage: /headroom archives [list|clear <sessionId> [confirm]]", "warn");
+        } catch (error) {
+          ctx.ui.notify(`Archive operation failed: ${errorMessage(error)}`, "error");
+        }
+      } else if (action === "rollback") {
+        try {
+          if (!acquireUpdateLock())
+            throw new Error(
+              "Another installation operation is running; try again after it completes.",
+            );
+          try {
+            const snapshot = JSON.parse(readFileSync(ROLLBACK_SNAPSHOT_FILE, "utf8"));
+            if (!(await ownsUpdateTarget(state)))
+              throw new Error(
+                "Rollback requires a loopback proxy owned by this extension or its configured service.",
+              );
+            setCompatibilityBlocked(state, true);
+            await restoreInstallationSnapshot(snapshot);
+            if (!(await restartProxy(ctx, state)))
+              throw new Error("Restored packages, but the proxy could not restart.");
+            const verified = await checkProxyCapabilities(PROXY_URL, undefined, TOOL_TIMEOUT_MS);
+            state.capabilities = verified;
+            setCompatibilityBlocked(state, !verified.compatible);
+            state.version = await installedVersion();
+            writeUpdateStamp({ checkedAt: Date.now(), latest: state.version });
+            ctx.ui.notify(
+              `Restored Headroom ${state.version}; compatibility ${verified.compatible ? "verified" : "failed; compression remains paused"}.`,
+              verified.compatible ? "info" : "warn",
+            );
+          } finally {
+            releaseUpdateLock();
+          }
+        } catch (error) {
+          ctx.ui.notify(`Rollback failed: ${errorMessage(error)}`, "error");
+        }
       } else if (action === "compact") {
         await runHeadroomCompaction(ctx, state);
       } else if (action === "clear") {

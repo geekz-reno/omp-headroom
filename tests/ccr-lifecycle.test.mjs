@@ -173,4 +173,63 @@ describe("CCR archive lifecycle", () => {
       expect(runIsolated(root, script)).toBe("ok");
     });
   });
+  test("old archive references cannot replace their originals or count as new compression", async () => {
+    await withTempDir(async (root) => {
+      const script = `
+        process.env.OMP_HEADROOM_BIN = process.argv[1];
+        const assert = (await import("node:assert/strict")).default;
+        const ccr = await import(process.argv[2] + "/src/ccr.ts");
+        const config = await import(process.argv[2] + "/src/config.ts");
+        const state = { sessionId: "${SESSION_A}", ccrHashes: 0 };
+        const ctx = { hasUI: true, sessionManager: { getSessionId: () => "${SESSION_A}" } };
+        const fullPrefix = "Full original prefix: decisions and requirements before archival.";
+        assert.equal(await ccr.persistCcrByHash("${HASH}", fullPrefix, state, ctx), 1);
+        state.ccrHashes = 0;
+        const original = "Existing archive hash=${HASH}; current tool output is detailed.";
+        const compressed = "Existing archive hash=${HASH}; short tool output.";
+        for (const ccrHashes of [[], ["${HASH}"]]) {
+          assert.equal(await ccr.persistCcrOriginal({ ccrHashes }, original, compressed, state, ctx), 0);
+        }
+        assert.equal(await ccr.readCcrFallback("${HASH}", config.CCR_DIR, "${SESSION_A}"), fullPrefix);
+        assert.equal(state.ccrHashes, 0);
+        process.stdout.write("ok");
+      `;
+      expect(runIsolated(root, script)).toBe("ok");
+    });
+  });
+
+  test("existing and concurrent hash collisions fail without replacing any original", async () => {
+    await withTempDir(async (root) => {
+      const script = `
+        process.env.OMP_HEADROOM_BIN = process.argv[1];
+        const assert = (await import("node:assert/strict")).default;
+        const fs = await import("node:fs");
+        const ccr = await import(process.argv[2] + "/src/ccr.ts");
+        const config = await import(process.argv[2] + "/src/config.ts");
+        const state = { sessionId: "${SESSION_A}", ccrHashes: 0 };
+        const ctx = { hasUI: true, sessionManager: { getSessionId: () => "${SESSION_A}" } };
+        const marker = "[compressed. Retrieve more: hash=${HASH}]";
+        assert.equal(await ccr.persistCcrByHash("${HASH}", "first original", state, ctx), 1);
+        state.ccrHashes = 0;
+        assert.equal(await ccr.persistCcrOriginal({ ccrHashes: ["${HASH}"] }, "different original", marker, state, ctx), 0);
+        assert.equal(await ccr.persistCcrOriginalBatch([{ originalText: "different original", compressedText: marker }], state, ctx), 0);
+        assert.equal(await ccr.persistCcrByHash("${HASH}", "different original", state, ctx), 0);
+        assert.equal(await ccr.readCcrFallback("${HASH}", config.CCR_DIR, "${SESSION_A}"), "first original");
+        assert.equal(state.ccrHashes, 0);
+        const otherHash = "123456789abcdef012345678";
+        const attempts = await Promise.all([
+          ccr.persistCcrByHash(otherHash, "concurrent first", state, ctx),
+          ccr.persistCcrByHash(otherHash, "concurrent second", state, ctx),
+        ]);
+        assert.equal(attempts.reduce((a, b) => a + b, 0), 1);
+        const winner = attempts[0] ? "concurrent first" : "concurrent second";
+        assert.equal(await ccr.readCcrFallback(otherHash, config.CCR_DIR, "${SESSION_A}"), winner);
+        assert.equal(await ccr.persistCcrByHash(otherHash, winner, state, ctx), 1);
+        const files = fs.readdirSync(ccr.ccrSessionDir("${SESSION_A}", config.CCR_DIR));
+        assert.equal(files.some(name => name.includes(".tmp.")), false);
+        process.stdout.write("ok");
+      `;
+      expect(runIsolated(root, script)).toBe("ok");
+    });
+  });
 });

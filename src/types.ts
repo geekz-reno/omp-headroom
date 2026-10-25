@@ -1,5 +1,7 @@
 import type { ChildProcess } from "node:child_process";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { CompressionTelemetry } from "./telemetry.ts";
+import type { ProxyCapabilities } from "./update-safety.ts";
 
 // Shared structural types for the Headroom extension. `HeadroomState` is the
 // per-factory-call mutable state object; `HeadroomCtx` is a permissive view of
@@ -34,6 +36,9 @@ export interface ProxyStats {
 }
 
 export interface HeadroomState {
+  telemetry?: CompressionTelemetry;
+  capabilities?: ProxyCapabilities;
+  compatibilityBlocked?: boolean;
   enabled: boolean;
   proxyReady: boolean;
   proxyStarting: boolean;

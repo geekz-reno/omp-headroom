@@ -70,6 +70,69 @@ function messageHasSessionArchive(message: unknown): boolean {
   return texts.some((text) => text.includes(SESSION_ARCHIVE_MARKER));
 }
 
+function isTextOnlyArchiveContent(content: unknown): boolean {
+  if (content === undefined || content === null || typeof content === "string") return true;
+  if (!Array.isArray(content)) return false;
+  return content.every((block) => {
+    if (typeof block === "string") return true;
+    if (!isRecord(block)) return false;
+    switch (block.type) {
+      case "text":
+      case "input_text":
+      case "output_text":
+      case "thinking":
+      case "redacted_thinking":
+      case "refusal":
+      case "tool_use":
+      case "server_tool_use":
+        return true;
+      case "tool_result":
+        return isTextOnlyArchiveContent(block.content);
+      default:
+        return false;
+    }
+  });
+}
+
+function isTextOnlyArchiveMessage(message: unknown): boolean {
+  if (!isRecord(message)) return typeof message === "string";
+  if (message.audio !== undefined) return false;
+  if (message.type === "reasoning") {
+    if (message.encrypted_content !== undefined && message.encrypted_content !== null) {
+      return false;
+    }
+    for (const [key, type] of [
+      ["summary", "summary_text"],
+      ["content", "reasoning_text"],
+    ]) {
+      const blocks = message[key];
+      if (blocks === undefined) continue;
+      if (
+        !Array.isArray(blocks) ||
+        !blocks.every(
+          (block) => isRecord(block) && block.type === type && typeof block.text === "string",
+        )
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (
+    message.type !== undefined &&
+    ![
+      "message",
+      "function_call",
+      "function_call_output",
+      "custom_tool_call",
+      "custom_tool_call_output",
+    ].includes(String(message.type))
+  ) {
+    return false;
+  }
+  return isTextOnlyArchiveContent(message.content) && isTextOnlyArchiveContent(message.output);
+}
+
 function messageToolCallIds(message: unknown): string[] {
   if (!isRecord(message)) return [];
   const ids: string[] = [];
@@ -121,7 +184,9 @@ function messageToolResultIds(message: unknown): string[] {
 }
 
 function safeSessionCut(messages: unknown[], requestedCut: number): number {
-  let cut = Math.max(0, Math.min(messages.length, requestedCut));
+  let cut = Number.isFinite(requestedCut)
+    ? Math.max(0, Math.min(messages.length, Math.floor(requestedCut)))
+    : 0;
   let changed = true;
   while (changed && cut > 0) {
     changed = false;
@@ -196,7 +261,11 @@ export function createSessionCompaction(
   }
   const head = messages.slice(0, headCount);
   const body = messages.slice(headCount);
-  const liveMessages = Math.max(1, Number(options.liveMessages ?? SESSION_LIVE_MESSAGES));
+  const requestedLiveMessages = Number(options.liveMessages ?? SESSION_LIVE_MESSAGES);
+  if (!Number.isFinite(requestedLiveMessages)) {
+    return passThrough(messages, "invalid_live_messages");
+  }
+  const liveMessages = Math.max(1, Math.ceil(requestedLiveMessages));
   const cut = safeSessionCut(body, Math.max(0, body.length - liveMessages));
   if (cut <= 0) return passThrough(messages, "no_safe_prefix");
   for (let index = cut; index < body.length; index++) {
@@ -205,6 +274,11 @@ export function createSessionCompaction(
 
   const prefix = body.slice(0, cut);
   const live = body.slice(cut);
+  // Retrieval currently returns text only. Preserve content whose original
+  // modality cannot be restored by a serialized CCR tool result.
+  if (!prefix.every(isTextOnlyArchiveMessage)) {
+    return passThrough(messages, "unsupported_prefix_content");
+  }
   const prefixChars = prefix.reduce<number>((sum, message) => sum + messageApproxChars(message), 0);
   const totalChars = body.reduce<number>((sum, message) => sum + messageApproxChars(message), 0);
   const minPrefixChars = Math.max(0, Number(options.minPrefixChars ?? SESSION_PREFIX_MIN_CHARS));

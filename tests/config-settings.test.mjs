@@ -62,6 +62,21 @@ test("parseSettingValue validates by kind", () => {
   expect(() => parseSettingValue(numberSetting, "  ")).toThrow(/requires a value/);
 });
 
+test("live-message counts require positive integers without restricting ratios", async () => {
+  const { invalidSettingValue } = await import("../src/config.ts");
+  const count = HEADROOM_SETTINGS.find((entry) => entry.key === "session_live_messages");
+  for (const value of ["1.5", "0", "-2", "NaN", "Infinity"]) {
+    expect(() => parseSettingValue(count, value)).toThrow();
+    expect(effectiveSettingValue(count, { session_live_messages: value }, {})).toBe(24);
+    expect(effectiveSettingValue(count, {}, { OMP_HEADROOM_LIVE_MESSAGES: value })).toBe(24);
+    expect(invalidSettingValue(count, { session_live_messages: value }, {})).toBe(value);
+  }
+  expect(parseSettingValue(count, "2")).toBe(2);
+  expect(invalidSettingValue(count, { session_live_messages: 2 }, {})).toBeUndefined();
+  const ratio = HEADROOM_SETTINGS.find((entry) => entry.key === "adaptive_start");
+  expect(parseSettingValue(ratio, "0.5")).toBe(0.5);
+});
+
 test("saveHeadroomConfigKey persists atomically and preserves unknown keys", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headroom-config-"));
   const path = join(dir, "headroom.yml");

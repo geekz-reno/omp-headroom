@@ -1,8 +1,8 @@
 // Compression-Cache-Retrieval (CCR) fallback store. Persists the full
 // originals of compressed payloads to disk so headroom_retrieve keeps working
 // even after the proxy's in-memory TTL expires.
-import { type Dirent, existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, rmdir, unlink, writeFile } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import { link, mkdir, readdir, readFile, rmdir, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CCR_DIR } from "./config.ts";
 import { shared } from "./state.ts";
@@ -59,25 +59,25 @@ async function writeSessionOriginal(
   hash: string,
   originalText: string,
   sessionId: string,
-  overwrite: boolean,
 ): Promise<boolean> {
   const dir = ccrSessionDir(sessionId);
   const file = ccrFallbackPath(hash, CCR_DIR, sessionId);
   if (!dir || !file) return false;
   await mkdir(dir, { recursive: true });
-  if (!overwrite && existsSync(file)) return true;
   const tmp = `${file}.tmp.${process.pid}.${Math.random().toString(36).slice(2)}`;
   try {
-    await writeFile(tmp, originalText, "utf8");
-    await rename(tmp, file);
-    return true;
-  } catch (error) {
+    await writeFile(tmp, originalText, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    // Publish a complete file without replacing an existing hash, even when
+    // concurrent compression requests race to persist different originals.
     try {
-      await unlink(tmp);
-    } catch {
-      // Nothing to clean up.
+      await link(tmp, file);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+      return (await readFile(file, "utf8")) === originalText;
     }
-    throw error;
+  } finally {
+    await unlink(tmp).catch(() => {});
   }
 }
 
@@ -100,6 +100,17 @@ function compressionHashes(
   return hashes;
 }
 
+function newCompressionHashes(
+  result: { ccrHashes?: unknown } | null | undefined,
+  originalText: string,
+  compressedText: unknown,
+): Set<string> {
+  const existing = compressionHashes(undefined, originalText);
+  return new Set(
+    [...compressionHashes(result, compressedText)].filter((hash) => !existing.has(hash)),
+  );
+}
+
 export async function persistCcrOriginal(
   result: { ccrHashes?: unknown } | null | undefined,
   originalText: unknown,
@@ -109,14 +120,16 @@ export async function persistCcrOriginal(
 ): Promise<number> {
   try {
     // Some Headroom versions expose hashes only through inline retrieval markers.
-    const hashes = compressionHashes(result, compressedText);
+    if (typeof originalText !== "string" || !originalText) return 0;
+    const hashes = newCompressionHashes(result, originalText, compressedText);
     const sessionId = storageSessionId(state, ctx);
-    if (hashes.size === 0 || typeof originalText !== "string" || !originalText || !sessionId) {
+    if (hashes.size === 0 || !sessionId) {
       return 0;
     }
-    await Promise.all(
-      [...hashes].map((hash) => writeSessionOriginal(hash, originalText, sessionId, true)),
+    const persisted = await Promise.all(
+      [...hashes].map((hash) => writeSessionOriginal(hash, originalText, sessionId)),
     );
+    if (!persisted.every(Boolean)) return 0;
     // Count exactly 1 CCR per successful save — NOT hashes.size (which re-counts
     // old hashes from compressed text and causes exponential growth).
     if (state && ctx) {
@@ -146,7 +159,7 @@ export async function persistCcrOriginalBatch(
     const originalsByHash = new Map<string, string>();
     for (const entry of entries) {
       if (!entry.originalText) return 0;
-      const hashes = compressionHashes(undefined, entry.compressedText);
+      const hashes = newCompressionHashes(undefined, entry.originalText, entry.compressedText);
       if (hashes.size === 0) return 0;
       for (const hash of hashes) {
         const existing = originalsByHash.get(hash);
@@ -154,11 +167,12 @@ export async function persistCcrOriginalBatch(
         originalsByHash.set(hash, entry.originalText);
       }
     }
-    await Promise.all(
+    const persisted = await Promise.all(
       [...originalsByHash].map(([hash, original]) =>
-        writeSessionOriginal(hash, original, sessionId, true),
+        writeSessionOriginal(hash, original, sessionId),
       ),
     );
+    if (!persisted.every(Boolean)) return 0;
     if (state && ctx) {
       if (isMainSession(ctx)) state.ccrHashes += entries.length;
       else shared.foreignCcr += entries.length;
@@ -182,7 +196,7 @@ export async function persistCcrByHash(
     const sessionId = storageSessionId(state, ctx);
     const slug = typeof hash === "string" && ccrFallbackPath(hash) ? hash : "";
     if (!sessionId || !slug) return 0;
-    if (!(await writeSessionOriginal(slug, originalText, sessionId, false))) return 0;
+    if (!(await writeSessionOriginal(slug, originalText, sessionId))) return 0;
     if (state && ctx) {
       if (isMainSession(ctx)) state.ccrHashes += 1;
       else shared.foreignCcr += 1;

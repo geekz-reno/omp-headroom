@@ -38,6 +38,12 @@ function cfgStr(yamlKey: string, envKey: string, def: string): string {
   if (yamlKey in _cfg) return String(_cfg[yamlKey]);
   return def;
 }
+function validSettingNumber(key: string, value: number): boolean {
+  return (
+    Number.isFinite(value) &&
+    (key !== "session_live_messages" || (Number.isInteger(value) && value > 0))
+  );
+}
 function cfgNum(yamlKey: string, envKey: string, def: number): number {
   const v =
     process.env[envKey] !== undefined
@@ -47,7 +53,7 @@ function cfgNum(yamlKey: string, envKey: string, def: number): number {
         : undefined;
   if (v === undefined) return def;
   const n = Number(v);
-  return Number.isFinite(n) ? n : def;
+  return validSettingNumber(yamlKey, n) ? n : def;
 }
 function cfgBool(yamlKey: string, envKey: string, truthy: boolean): boolean {
   const v =
@@ -315,7 +321,7 @@ export function effectiveSettingValue(
   if (raw === undefined) return setting.def;
   if (setting.kind === "number") {
     const n = Number(raw);
-    return Number.isFinite(n) ? n : setting.def;
+    return validSettingNumber(setting.key, n) ? n : setting.def;
   }
   if (setting.kind === "boolean") {
     if (typeof raw === "boolean") return raw;
@@ -345,7 +351,7 @@ export function invalidSettingValue(
         : undefined;
   if (raw === undefined) return undefined;
   if (setting.kind === "number") {
-    return Number.isFinite(Number(raw)) ? undefined : String(raw);
+    return validSettingNumber(setting.key, Number(raw)) ? undefined : String(raw);
   }
   if (setting.kind === "boolean") {
     if (typeof raw === "boolean") return undefined;
@@ -367,6 +373,9 @@ export function parseSettingValue(
   if (setting.kind === "number") {
     const n = Number(trimmed);
     if (!Number.isFinite(n)) throw new Error(`"${setting.key}" expects a number, got "${trimmed}"`);
+    if (!validSettingNumber(setting.key, n)) {
+      throw new Error(`"${setting.key}" expects a positive integer, got "${trimmed}"`);
+    }
     return n;
   }
   if (setting.kind === "boolean") {

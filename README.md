@@ -24,10 +24,10 @@ flowchart LR
 - **Provider-path compression** — eligible OpenAI `messages`, Anthropic, and OpenAI Responses (`input`) payloads are compressed before they reach the provider. Oversized tool outputs compress concurrently in a bounded worker pool.
 - **Automatic provider archive** — before proxy compression, a sufficiently large stable conversation prefix is replaced only on the outbound request by a shorter structural index. The complete prefix is persisted to CCR first, while the newest 24 messages remain verbatim. This is the original source of widget `arch`; it is independent of OMP compaction.
 - **Strict reduction gate** — a candidate is accepted only when Headroom reports `tokens_after < tokens_before`, the actual outgoing payload is smaller, every user message is unchanged, and a local CCR fallback was persisted. Otherwise OMP sends the original payload unchanged and does not inject the retrieval tool.
-- **CCR retrieval** — accepted content carries a `Retrieve more: hash=…` marker; the model calls `headroom_retrieve` to read the original. The proxy store is backed by an atomic on-disk fallback.
+- **CCR retrieval** — accepted content carries a `Retrieve more: hash=…` marker; the model calls `headroom_retrieve` for bounded, searchable pages of the original. Durable local copies work while the proxy is offline.
 - **Headroom-assisted OMP compaction (`/headroom compact`)** — unlike OMP's plain `/compact`, this command arms a one-shot `session.compacting` hook that atomically archives the complete discarded source to CCR and adds fidelity guidance before OMP creates its semantic LLM summary. If archival fails, OMP still compacts but the plugin does not claim a recoverable archive.
 - **Adaptive thresholds** — as the context window fills (>50%), the "worth compressing" bar drops linearly, down to 25% of the base at 90% usage. More compression exactly when space is scarce.
-- **Autoupdate** — the extension checks PyPI daily, upgrades `headroom-ai` in place, re-pins the ROCm torch build when needed, and restarts the proxy.
+- **Verified updates** — the extension checks PyPI daily, snapshots installed package versions, upgrades `headroom-ai`, preserves the ROCm backend, and verifies compression plus retrieval. A failed upgrade or capability check restores the recorded versions and verifies recovery.
 - **Live widget** — savings, provider-native prompt-cache hit rate and traffic, request/tool/CCR counters, archive state, and per-session cost, rendered in a compact 5-row box.
 
 ## Install
@@ -109,6 +109,11 @@ Type `/headroom ` in OMP to open argument completion. Commands are intercepted b
 | Command                          | Purpose                                                                                                                                                                                                                  |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `/headroom` or `/headroom stats` | Show proxy, archive, and CCR compression statistics.                                                                                                                                                                     |
+| `/headroom doctor` | Check proxy readiness, strict token metrics, and complete CCR retrieval using synthetic content. A failed check pauses compression until recovery. |
+| `/headroom telemetry` | Show accepted/rejected compression attempts, average latency, retrieval cost and net savings estimates, and independent prompt-cache traffic. |
+| `/headroom archives` | List owned session archive files, disk usage, modification times, and retained unowned entries. |
+| `/headroom archives clear <sessionId>` | Preview selective cleanup for another session. Append `confirm` to delete its owned files. Use `/headroom clear session` for the active session. |
+| `/headroom rollback` | Restore the previous update's recorded package versions, restart the owned proxy, and verify its capabilities. |
 | `/headroom on`                   | Enable Headroom for the current session.                                                                                                                                                                                 |
 | `/headroom off`                  | Disable Headroom and restore the full provider payload for the current session. Existing CCR archives remain retrievable.                                                                                                |
 | `/headroom compact`              | Run OMP semantic compaction with Headroom fidelity guidance and a recoverable CCR copy of the discarded source.                                                                                                          |
@@ -127,6 +132,29 @@ Type `/headroom ` in OMP to open argument completion. Commands are intercepted b
 | `/headroom update`               | Check PyPI, update `headroom-ai`, preserve the selected GPU backend, and restart the proxy when required.                                                                                                                |
 
 ## Widget
+
+`headroom_retrieve` accepts `hash`, optional literal case-insensitive `query`,
+and character `offset`/`limit`. The default page is 12,000 characters; the maximum
+is 32,000. Results include `next_offset` and continuation instructions. With a
+query, offsets address the filtered view, whose matching lines retain original
+line numbers. A durable local original is read first, with no proxy request.
+
+`/headroom telemetry` and `/headroom stats` show compression latency and rejection
+categories. Net token savings subtract retrieved text at an explicit estimate of
+one token per four characters. Prompt-cache reads/writes remain separate provider
+measurements; the net estimate does not claim to measure causal cache effects.
+Telemetry resets on a new session; archive counters remain persistent.
+
+Updates and rollback mutate only the extension's owned loopback proxy or the
+configured service whose executable matches this installation. An unowned or
+remote proxy must be updated through its owner. `.headroom-rollback.json` beside
+the venv records prior package versions. Rollback may need the package cache or
+package indexes; incomplete recovery is reported and compression stays paused.
+The installation lock and private `.headroom-compatibility.json` marker keep
+that pause consistent across factories and processes sharing the environment.
+Doctor waits for an active installation to finish before clearing the pause.
+Archive cleanup is explicit and never follows symlinks or deletes unowned legacy
+files. Retained unknown files are listed rather than silently removed.
 
 The unified `arch Nch ×M` metric describes automatic provider-prefix archiving in both volume and count:
 
@@ -178,6 +206,11 @@ sequenceDiagram
 ```
 
 Automatic compression and provider archiving never rewrite visible transcript messages. They alter only a strictly smaller outbound provider payload after its removed bytes are durably retrievable. `headroom_compress` remains an explicit manual operation and therefore returns its compact result visibly.
+
+Automatic archiving leaves a prefix intact when it contains images, audio,
+documents, or other unsupported content that text-only CCR retrieval cannot
+restore. `session_live_messages` must be a positive integer; invalid stored or
+environment values use the default of 24.
 
 > **Widget placement caveat:** this extension asks for the `rightEditor` widget slot, which currently exists only in a right-panel OMP fork that has not been merged upstream. On stock OMP the widget renders at the **bottom** of the screen (the default slot) — functional, just a different position. Override with `OMP_HEADROOM_WIDGET_PLACEMENT`.
 

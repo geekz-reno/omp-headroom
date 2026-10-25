@@ -9,6 +9,7 @@ import {
   WIDGET_PRIORITY,
 } from "./config.ts";
 import { shared, subagentSessionIds } from "./state.ts";
+import { telemetrySummary } from "./telemetry.ts";
 import type { HeadroomCtx, HeadroomState, ProxyProjectStats } from "./types.ts";
 import {
   asNumber,
@@ -228,5 +229,6 @@ export function commandSummary(state: HeadroomState): string {
     );
   }
   if (state.lastError) lines.push(`Last error: ${state.lastError}`);
+  lines.push(telemetrySummary(state, state.cacheReadTokens, state.cacheWriteTokens));
   return lines.join("\n");
 }

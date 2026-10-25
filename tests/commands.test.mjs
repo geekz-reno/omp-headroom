@@ -153,6 +153,9 @@ describe("/headroom compaction commands", () => {
                     }
                     if (url.pathname !== "/v1/compress") return new Response("not found", { status: 404 });
                     const body = await request.json();
+                    if (body.config?.mode !== "ccr") {
+                        return Response.json({ messages: body.messages, tokens_before: 245, tokens_after: 245, ccr_hashes: [] });
+                    }
                     const messages = body.messages.map((message, index) =>
                         index === body.messages.length - 1
                             ? { ...message, content: "[245 items compressed to 17. Retrieve more: hash=0123456789abcdef01234567]" }

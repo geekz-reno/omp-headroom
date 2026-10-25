@@ -140,6 +140,188 @@ describe("automatic provider-path archive projection", () => {
 });
 
 describe("archive boundary safety", () => {
+  test("keeps an eligible multimodal prefix intact without persisting a text-only archive", async () => {
+    const { messages } = makeDefaultEligibleMessages();
+    messages[1].content = [
+      { type: "text", text: "What does this screenshot show?" },
+      {
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "image-data" },
+      },
+    ];
+    let persistCalls = 0;
+
+    const result = await applySessionArchive(messages, {}, async () => {
+      persistCalls += 1;
+      return true;
+    });
+
+    expect(result.compacted).toBe(false);
+    expect(result.messages).toBe(messages);
+    expect(persistCalls).toBe(0);
+  });
+
+  test.each([
+    { type: "image_url", image_url: { url: "https://example.invalid/image.png" } },
+    { type: "document", source: { type: "base64", media_type: "application/pdf", data: "pdf" } },
+    { type: "input_audio", input_audio: { data: "audio", format: "wav" } },
+    { type: "future_non_text", data: "opaque" },
+  ])("preserves non-text content blocks, including unknown modalities: $type", (block) => {
+    const { messages } = makeDefaultEligibleMessages();
+    messages[1].content = [{ type: "text", text: "old question" }, block];
+    expect(createSessionCompaction(messages).messages).toBe(messages);
+  });
+
+  test("preserves multimodal content nested in Anthropic tool results", () => {
+    const { messages } = makeDefaultEligibleMessages();
+    messages[1].content = [
+      {
+        type: "tool_result",
+        tool_use_id: "old-image-call",
+        content: [
+          { type: "text", text: "screenshot" },
+          { type: "image", source: { type: "url", url: "https://example.invalid/image.png" } },
+        ],
+      },
+    ];
+    expect(createSessionCompaction(messages).messages).toBe(messages);
+  });
+
+  test("preserves Responses top-level images and multimodal tool outputs", () => {
+    for (const item of [
+      { type: "input_image", image_url: "https://example.invalid/image.png" },
+      {
+        type: "function_call_output",
+        call_id: "old-image-call",
+        output: [{ type: "input_image", image_url: "https://example.invalid/image.png" }],
+      },
+    ]) {
+      const { messages } = makeDefaultEligibleMessages();
+      messages[1] = item;
+      const result = createResponsesSessionCompaction(messages);
+      expect(result.compacted).toBe(false);
+      expect(result.input).toBe(messages);
+    }
+  });
+
+  test("archives text-only Responses reasoning alongside the eligible prefix", () => {
+    const { messages, liveTail } = makeDefaultEligibleMessages();
+    messages.splice(3, 0, {
+      type: "reasoning",
+      id: "rs-text-only",
+      summary: [{ type: "summary_text", text: "Earlier reasoning summary." }],
+      content: [{ type: "reasoning_text", text: "Earlier reasoning detail." }],
+    });
+
+    const result = createResponsesSessionCompaction(messages);
+    expect(result.compacted).toBe(true);
+    expect(result.originalText).toContain("Earlier reasoning summary.");
+    expect(result.originalText).toContain("Earlier reasoning detail.");
+    expect(result.input.slice(-liveTail.length)).toEqual(liveTail);
+  });
+
+  test("preserves encrypted reasoning and unsupported reasoning content", () => {
+    for (const item of [
+      { type: "reasoning", summary: [], encrypted_content: "opaque-reasoning" },
+      { type: "reasoning", summary: [{ type: "future_summary", text: "opaque" }] },
+      { type: "reasoning", summary: [], content: [{ type: "input_image", image_url: "image" }] },
+      { type: "reasoning", summary: [{ type: "summary_text", text: { unknown: "content" } }] },
+    ]) {
+      const { messages } = makeDefaultEligibleMessages();
+      messages.splice(3, 0, item);
+      const result = createResponsesSessionCompaction(messages);
+      expect(result.compacted).toBe(false);
+      expect(result.input).toBe(messages);
+    }
+  });
+
+  test("archives text-only Anthropic tool blocks and preserves a multimodal live tail", () => {
+    const { messages } = makeDefaultEligibleMessages();
+    messages[1].content = [{ type: "tool_use", id: "old-call", name: "read", input: {} }];
+    messages[2].content = [
+      {
+        type: "tool_result",
+        tool_use_id: "old-call",
+        content: [{ type: "text", text: "old output ".repeat(1000) }],
+      },
+    ];
+    const imageMessage = {
+      role: "user",
+      content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "image" } },
+      ],
+    };
+    messages[messages.length - 1] = imageMessage;
+
+    const result = createSessionCompaction(messages);
+    expect(result.compacted).toBe(true);
+    expect(result.messages.at(-1)).toBe(imageMessage);
+  });
+
+  test("normalizes fractional live tails before preserving OpenAI tool pairs", () => {
+    const { messages } = makeDefaultEligibleMessages();
+    messages.push(
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "fractional-call", type: "function", function: { name: "read", arguments: "{}" } },
+        ],
+      },
+      { role: "tool", tool_call_id: "fractional-call", content: "tool output" },
+      { role: "user", content: "continue" },
+    );
+
+    const result = createSessionCompaction(messages, { ...explicitOptions, liveMessages: 1.5 });
+    expect(result.compacted).toBe(true);
+    expect(result.messages.slice(-3)).toEqual(messages.slice(-3));
+  });
+
+  test("normalizes fractional live tails before preserving Anthropic tool pairs", () => {
+    const { messages } = makeDefaultEligibleMessages();
+    messages.push(
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "fractional-call", name: "read", input: {} }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "fractional-call", content: "tool output" }],
+      },
+      { role: "user", content: "continue" },
+    );
+
+    const result = createSessionCompaction(messages, { ...explicitOptions, liveMessages: 1.5 });
+    expect(result.compacted).toBe(true);
+    expect(result.messages.slice(-3)).toEqual(messages.slice(-3));
+  });
+
+  test("normalizes fractional live tails before preserving Responses tool pairs", () => {
+    const { messages } = makeDefaultEligibleMessages();
+    messages.push(
+      { type: "function_call", call_id: "fractional-call", name: "read", arguments: "{}" },
+      { type: "function_call_output", call_id: "fractional-call", output: "tool output" },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
+    );
+
+    const result = createResponsesSessionCompaction(messages, {
+      ...explicitOptions,
+      liveMessages: 1.5,
+    });
+    expect(result.compacted).toBe(true);
+    expect(result.input.slice(-3)).toEqual(messages.slice(-3));
+  });
+
+  test.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "leaves the payload unchanged for a non-finite live-tail count: %s",
+    (liveMessages) => {
+      const { messages } = makeDefaultEligibleMessages();
+      const result = createSessionCompaction(messages, { ...explicitOptions, liveMessages });
+      expect(result.compacted).toBe(false);
+      expect(result.messages).toBe(messages);
+    },
+  );
+
   test("keeps Responses archive text valid when truncation meets an astral character", () => {
     const splitPair = `${"a".repeat(39)}😀${"b".repeat(240)}`;
     const result = createResponsesSessionCompaction(
