@@ -153,6 +153,11 @@ package indexes; incomplete recovery is reported and compression stays paused.
 The installation lock and private `.headroom-compatibility.json` marker keep
 that pause consistent across factories and processes sharing the environment.
 Doctor waits for an active installation to finish before clearing the pause.
+Stale installation locks are reclaimed only after 45 minutes and only when the
+owner process is gone. A short-lived `.headroom-update.lock.guard` directory
+beside the venv serializes recovery. If a process is killed during that metadata
+step, stop all OMP processes sharing the venv before removing the empty guard
+directory; it is never automatically stolen from another recovery attempt.
 Archive cleanup is explicit and never follows symlinks or deletes unowned legacy
 files. Retained unknown files are listed rather than silently removed.
 

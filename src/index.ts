@@ -8,7 +8,6 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -106,6 +105,7 @@ import {
 import { paginateRetrieveResult, retrieveViaProxy, stringifyRetrieveResult } from "./tools.ts";
 import type { HeadroomCtx, HeadroomState } from "./types.ts";
 import { isUpdateGateBlocked, setUpdateGateBlocked } from "./update-gate.ts";
+import { createUpdateLock } from "./update-lock.ts";
 import { checkProxyCapabilities, runVerifiedUpdate } from "./update-safety.ts";
 import {
   asNumber,
@@ -404,49 +404,8 @@ function writeUpdateStamp(stamp) {
   }
 }
 
-function acquireUpdateLock() {
-  try {
-    writeFileSync(UPDATE_LOCK_FILE, String(process.pid), { flag: "wx" });
-    return true;
-  } catch {
-    try {
-      // Self-steal: if the lock contains OUR OWN PID, a previous
-      // doMaintainInstall in this same process crashed without
-      // releasing (e.g. unhandled rejection bypassing finally).
-      // Safe to reclaim — no other update can be in flight.
-      const lockPid = readFileSync(UPDATE_LOCK_FILE, "utf8").trim();
-      if (lockPid === String(process.pid)) {
-        writeFileSync(UPDATE_LOCK_FILE, String(process.pid));
-        return true;
-      }
-      // Stale after 45 min (previous OMP session crashed mid-update). Steal
-      // atomically (unlink + wx create): a plain write could race another
-      // stealer and leave two updaters believing they hold the lock.
-      if (Date.now() - statSync(UPDATE_LOCK_FILE).mtimeMs > 45 * 60_000) {
-        try {
-          unlinkSync(UPDATE_LOCK_FILE);
-        } catch {}
-        try {
-          writeFileSync(UPDATE_LOCK_FILE, String(process.pid), { flag: "wx" });
-          return true;
-        } catch {
-          return false; // Lost the steal race; the winner owns the lock.
-        }
-      }
-    } catch {
-      // Lock vanished mid-check; do not race for it.
-    }
-    return false;
-  }
-}
-
-function releaseUpdateLock() {
-  try {
-    unlinkSync(UPDATE_LOCK_FILE);
-  } catch {
-    // Already gone.
-  }
-}
+const { acquire: acquireUpdateLock, release: releaseUpdateLock } =
+  createUpdateLock(UPDATE_LOCK_FILE);
 
 let maintenanceInFlight: Promise<void> | undefined;
 
@@ -1617,7 +1576,7 @@ function responsesBatchChunks(input, minToolChars) {
   return chunks;
 }
 
-async function compressResponsesBatch(entries, workingPayload, ctx, state) {
+async function compressResponsesBatch(entries, workingPayload, ctx, state, timeoutMs) {
   const toolCalls = entries.map((entry) => {
     const id =
       typeof entry.item.call_id === "string"
@@ -1645,7 +1604,7 @@ async function compressResponsesBatch(entries, workingPayload, ctx, state) {
     messages,
     normalizeModel(workingPayload, ctx),
     undefined,
-    PROVIDER_TIMEOUT_MS,
+    timeoutMs,
     state,
     { targeted: true },
   );
@@ -1717,28 +1676,40 @@ export async function compressResponsesPayload(
   // Whole-pass deadline + failure breaker: a stalled proxy must not turn this
   // hook into minutes of sequential 12s timeouts (mirrors ANTHROPIC_BUDGET_MS).
   const RESPONSES_BUDGET_MS = 24_000;
-  const startMs = Date.now();
-  const overBudget = () => Date.now() - startMs > RESPONSES_BUDGET_MS;
-  let failures = 0;
+  const deadline = performance.now() + RESPONSES_BUDGET_MS;
+  const remainingMs = () => Math.max(0, Math.floor(deadline - performance.now()));
+  let consecutiveFailures = 0;
+  let circuitOpen = false;
+  const canContinue = () => !circuitOpen && remainingMs() > 0;
+  const recordFailure = () => {
+    consecutiveFailures += 1;
+    if (consecutiveFailures >= 2) circuitOpen = true;
+  };
   const minToolChars = adaptiveMinChars(MIN_TOOL_TEXT_CHARS, contextUsageRatio(ctx));
   const nextInput: unknown[] = [...input];
   for (const batchEntries of responsesBatchChunks(input, minToolChars)) {
-    if (overBudget() || failures >= 2) break;
+    if (!canContinue()) break;
     try {
-      const batch = await compressResponsesBatch(batchEntries, workingPayload, ctx, state);
+      const batch = await compressResponsesBatch(
+        batchEntries,
+        workingPayload,
+        ctx,
+        state,
+        Math.min(PROVIDER_TIMEOUT_MS, remainingMs()),
+      );
+      consecutiveFailures = 0;
       if (!batch) continue;
       for (const entry of batch.changes) nextInput[entry.index] = entry.item;
       recordCompression(state, "provider", batch.result, ctx);
       changed = true;
     } catch {
-      // Batch failure is fail-open; oversized outputs still run independently.
-      // Two consecutive failures ⇒ the proxy is down for this pass; remaining
-      // batches would only burn their full timeout each.
-      failures += 1;
+      // Keep originals after a failure. Two consecutive failures stop new
+      // requests across both the batch loop and the oversized-output workers.
+      recordFailure();
     }
   }
   const compressItem = async (item) => {
-    if (overBudget()) return { item };
+    if (!canContinue()) return { item };
     const output = responseOutputText(item);
     if (
       output === undefined ||
@@ -1768,10 +1739,11 @@ export async function compressResponsesPayload(
         messages,
         normalizeModel(workingPayload, ctx),
         undefined,
-        PROVIDER_TIMEOUT_MS,
+        Math.min(PROVIDER_TIMEOUT_MS, remainingMs()),
         state,
         { targeted: true },
       );
+      consecutiveFailures = 0;
       const compressedMessage = result?.messages?.at?.(-1);
       const compressed = isRecord(compressedMessage) ? compressedMessage.content : undefined;
       if (
@@ -1783,8 +1755,9 @@ export async function compressResponsesPayload(
       }
       finishCompressionAttempt(state, result, false, "nonbeneficial");
     } catch {
-      // A failed item keeps its original output; other items still compress.
-      failures += 1;
+      // In-flight requests may finish, but the open circuit stays open even
+      // if another worker subsequently succeeds.
+      recordFailure();
     }
     return { item };
   };
