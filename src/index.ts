@@ -96,7 +96,7 @@ import {
   expandSessionArchiveText,
   type SessionArchiveCandidate,
 } from "./session-archive.ts";
-import { createHeadroomState, readForeignTotals, shared, subagentSessionIds } from "./state.ts";
+import { createHeadroomState, shared, subagentSessionIds } from "./state.ts";
 import {
   createCompressionTelemetry,
   recordCompressionAttempt,
@@ -392,9 +392,14 @@ function readUpdateStamp() {
 }
 
 function writeUpdateStamp(stamp) {
+  const temporaryPath = `${UPDATE_STATE_FILE}.${process.pid}.tmp`;
   try {
-    writeFileSync(UPDATE_STATE_FILE, JSON.stringify(stamp));
+    writeFileSync(temporaryPath, JSON.stringify(stamp));
+    renameSync(temporaryPath, UPDATE_STATE_FILE);
   } catch {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {}
     // Best effort.
   }
 }
@@ -414,10 +419,19 @@ function acquireUpdateLock() {
         writeFileSync(UPDATE_LOCK_FILE, String(process.pid));
         return true;
       }
-      // Stale after 45 min (previous OMP session crashed mid-update).
+      // Stale after 45 min (previous OMP session crashed mid-update). Steal
+      // atomically (unlink + wx create): a plain write could race another
+      // stealer and leave two updaters believing they hold the lock.
       if (Date.now() - statSync(UPDATE_LOCK_FILE).mtimeMs > 45 * 60_000) {
-        writeFileSync(UPDATE_LOCK_FILE, String(process.pid));
-        return true;
+        try {
+          unlinkSync(UPDATE_LOCK_FILE);
+        } catch {}
+        try {
+          writeFileSync(UPDATE_LOCK_FILE, String(process.pid), { flag: "wx" });
+          return true;
+        } catch {
+          return false; // Lost the steal race; the winner owns the lock.
+        }
       }
     } catch {
       // Lock vanished mid-check; do not race for it.
@@ -1353,6 +1367,13 @@ async function persistSessionArchiveCandidate(
   return false;
 }
 
+// Serialized size for size-only comparisons. Plain stringify, not stableJson:
+// key sorting cannot change the output length, and this runs on every
+// provider request over the full transcript payload.
+function jsonSize(value: unknown): number {
+  return JSON.stringify(value)?.length ?? 0;
+}
+
 async function applyMessageSessionArchive(payload, provider, state, ctx) {
   if (!payloadHasRetrieveTool(payload)) return payload;
   if (provider === "anthropic") {
@@ -1363,7 +1384,7 @@ async function applyMessageSessionArchive(payload, provider, state, ctx) {
       ...payload,
       messages: candidate.messages.map(asAnthropicArchiveMessage),
     };
-    if (stableJson(projected).length >= stableJson(payload).length) return payload;
+    if (jsonSize(projected) >= jsonSize(payload)) return payload;
     return (await persistSessionArchiveCandidate(candidate, state, ctx)) ? projected : payload;
   }
 
@@ -1371,7 +1392,7 @@ async function applyMessageSessionArchive(payload, provider, state, ctx) {
   const candidate = createSessionCompaction(messages);
   if (!candidate.compacted) return payload;
   const projected = fromOpenAiPayloadMessages(payload, candidate.messages, hadSystem);
-  if (stableJson(projected).length >= stableJson(payload).length) return payload;
+  if (jsonSize(projected) >= jsonSize(payload)) return payload;
   return (await persistSessionArchiveCandidate(candidate, state, ctx)) ? projected : payload;
 }
 
@@ -1381,7 +1402,7 @@ async function applyResponsesSessionArchive(payload, state, ctx) {
   const candidate = createResponsesSessionCompaction(input);
   if (!candidate.compacted) return payload;
   const projected = { ...payload, input: candidate.input };
-  if (stableJson(projected).length >= stableJson(payload).length) return payload;
+  if (jsonSize(projected) >= jsonSize(payload)) return payload;
   return (await persistSessionArchiveCandidate(candidate, state, ctx)) ? projected : payload;
 }
 
@@ -1518,31 +1539,39 @@ async function compressAnthropicPayload(payload, ctx, state) {
         nextContent.push(block);
         continue;
       }
-      const result = await compressOpenAiMessages(
-        synthetic,
-        normalizeModel(payload, ctx),
-        undefined,
-        PROVIDER_TIMEOUT_MS,
-        state,
-        { targeted: true },
-      );
-      const compressedMessage = result?.messages?.at?.(-1);
-      const compressed = isRecord(compressedMessage) ? compressedMessage.content : undefined;
-      if (
-        isBeneficialCompressionResult(result) &&
-        typeof compressed === "string" &&
-        compressed.length < output.length
-      ) {
-        const persisted = await persistCcrOriginal(result, output, compressed, state, ctx);
-        if (persisted) {
-          nextContent.push({ ...block, content: compressed });
-          recordCompression(state, "provider", result, ctx);
-          contentChanged = true;
-          changed = true;
-          continue;
+      // A failed proxy call must not abort the whole pass: blocks already
+      // compressed stay compressed, this block keeps its original text, and
+      // the remaining blocks still get their chance (mirrors the Responses
+      // path's per-item isolation).
+      try {
+        const result = await compressOpenAiMessages(
+          synthetic,
+          normalizeModel(payload, ctx),
+          undefined,
+          PROVIDER_TIMEOUT_MS,
+          state,
+          { targeted: true },
+        );
+        const compressedMessage = result?.messages?.at?.(-1);
+        const compressed = isRecord(compressedMessage) ? compressedMessage.content : undefined;
+        if (
+          isBeneficialCompressionResult(result) &&
+          typeof compressed === "string" &&
+          compressed.length < output.length
+        ) {
+          const persisted = await persistCcrOriginal(result, output, compressed, state, ctx);
+          if (persisted) {
+            nextContent.push({ ...block, content: compressed });
+            recordCompression(state, "provider", result, ctx);
+            contentChanged = true;
+            changed = true;
+            continue;
+          }
         }
+        finishCompressionAttempt(state, result, false, "persistence");
+      } catch {
+        // Proxy/network failure on this block: keep the original text.
       }
-      finishCompressionAttempt(state, result, false, "persistence");
       nextContent.push(block);
     }
     nextMessages.push(contentChanged ? { ...message, content: nextContent } : message);
@@ -1685,10 +1714,16 @@ export async function compressResponsesPayload(
   // Batch individually-small outputs when their aggregate clears the adaptive
   // floor, then compress oversized outputs concurrently with bounded workers.
   // Input order and unchanged object identity are preserved.
-  let _failures = 0;
+  // Whole-pass deadline + failure breaker: a stalled proxy must not turn this
+  // hook into minutes of sequential 12s timeouts (mirrors ANTHROPIC_BUDGET_MS).
+  const RESPONSES_BUDGET_MS = 24_000;
+  const startMs = Date.now();
+  const overBudget = () => Date.now() - startMs > RESPONSES_BUDGET_MS;
+  let failures = 0;
   const minToolChars = adaptiveMinChars(MIN_TOOL_TEXT_CHARS, contextUsageRatio(ctx));
   const nextInput: unknown[] = [...input];
   for (const batchEntries of responsesBatchChunks(input, minToolChars)) {
+    if (overBudget() || failures >= 2) break;
     try {
       const batch = await compressResponsesBatch(batchEntries, workingPayload, ctx, state);
       if (!batch) continue;
@@ -1697,10 +1732,13 @@ export async function compressResponsesPayload(
       changed = true;
     } catch {
       // Batch failure is fail-open; oversized outputs still run independently.
-      _failures += 1;
+      // Two consecutive failures ⇒ the proxy is down for this pass; remaining
+      // batches would only burn their full timeout each.
+      failures += 1;
     }
   }
   const compressItem = async (item) => {
+    if (overBudget()) return { item };
     const output = responseOutputText(item);
     if (
       output === undefined ||
@@ -1746,7 +1784,7 @@ export async function compressResponsesPayload(
       finishCompressionAttempt(state, result, false, "nonbeneficial");
     } catch {
       // A failed item keeps its original output; other items still compress.
-      _failures += 1;
+      failures += 1;
     }
     return { item };
   };
@@ -1839,15 +1877,6 @@ async function fetchStats(state, force = false, timeoutMs = 3000) {
       state.proxyStarting = false;
       state.proxyCheckedAt = state.statsFetchedAt;
       state.lastError = "";
-      // Also refresh subagent (+N) totals from foreign files — this runs after
-      // every compression event on the main session, so (+N) updates promptly
-      // even if the rainbow timer's read is delayed or blocked.
-      try {
-        const t = readForeignTotals();
-        state.foreignProvider = t.provider;
-        state.foreignTool = t.tool;
-        state.foreignCcr = t.ccr;
-      } catch {}
       return state.stats;
     } catch (error) {
       state.lastError = `Headroom stats unavailable: ${error instanceof Error ? error.message : String(error)}`;
@@ -1900,45 +1929,58 @@ async function ensureProxy(ctx, state, waitMs = 0) {
       renderWidget(ctx, state);
       return false;
     }
-    state.proxyStarting = true;
-    if (await systemdUnitAvailable()) {
-      void systemdCtl("start").then((result) => {
-        if (result.code !== 0) {
-          state.proxyStarting = false;
-          state.lastError = `systemctl start failed: ${clip(result.err.trim(), 200)}`;
-        }
-      });
-      ctx?.ui?.notify?.(`Starting Headroom proxy via ${SYSTEMD_UNIT}…`, "info");
+    // Process-wide spawn claim: another factory instance (a subagent session
+    // with its own `state`) may be mid-spawn — `state.proxyStarting` cannot
+    // see it. The TTL covers the cold-start window; exit/error handlers below
+    // release the claim so a later session can respawn.
+    const SPAWN_CLAIM_TTL_MS = 150_000;
+    if (Date.now() - shared.proxySpawnClaimedAt < SPAWN_CLAIM_TTL_MS) {
+      // Someone else is bringing the proxy up; just poll below.
     } else {
-      const proxyEnv: NodeJS.ProcessEnv = { ...process.env, HEADROOM_TELEMETRY: "off" };
-      if (CODE_AWARE) proxyEnv.HEADROOM_CODE_AWARE_ENABLED ??= "1";
-      proxyEnv.HEADROOM_NO_SUBSCRIPTION_TRACKING ??= "1";
-      state.proxyProcess = spawn(
-        HEADROOM_BIN,
-        [
-          "proxy",
-          "--host",
-          "127.0.0.1",
-          "--port",
-          String(proxyPort()),
-          "--no-telemetry",
-          ...PROXY_EXTRA_ARGS,
-        ],
-        { env: proxyEnv, stdio: "ignore" },
-      );
-      state.proxyProcess.unref();
-      state.proxyProcess.once("error", (error) => {
-        state.lastError = errorMessage(error);
-        state.proxyStarting = false;
-        state.proxyProcess = undefined;
-      });
-      state.proxyProcess.once("exit", (code) => {
-        state.proxyStarting = false;
-        state.proxyProcess = undefined;
-        if (code !== null && code !== 0)
-          state.lastError = `Headroom proxy exited with code ${code}`;
-      });
-      ctx?.ui?.notify?.(`Starting Headroom proxy on ${PROXY_URL}…`, "info");
+      shared.proxySpawnClaimedAt = Date.now();
+      state.proxyStarting = true;
+      if (await systemdUnitAvailable()) {
+        void systemdCtl("start").then((result) => {
+          if (result.code !== 0) {
+            state.proxyStarting = false;
+            shared.proxySpawnClaimedAt = 0;
+            state.lastError = `systemctl start failed: ${clip(result.err.trim(), 200)}`;
+          }
+        });
+        ctx?.ui?.notify?.(`Starting Headroom proxy via ${SYSTEMD_UNIT}…`, "info");
+      } else {
+        const proxyEnv: NodeJS.ProcessEnv = { ...process.env, HEADROOM_TELEMETRY: "off" };
+        if (CODE_AWARE) proxyEnv.HEADROOM_CODE_AWARE_ENABLED ??= "1";
+        proxyEnv.HEADROOM_NO_SUBSCRIPTION_TRACKING ??= "1";
+        state.proxyProcess = spawn(
+          HEADROOM_BIN,
+          [
+            "proxy",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            String(proxyPort()),
+            "--no-telemetry",
+            ...PROXY_EXTRA_ARGS,
+          ],
+          { env: proxyEnv, stdio: "ignore" },
+        );
+        state.proxyProcess.unref();
+        state.proxyProcess.once("error", (error) => {
+          state.lastError = errorMessage(error);
+          state.proxyStarting = false;
+          state.proxyProcess = undefined;
+          shared.proxySpawnClaimedAt = 0;
+        });
+        state.proxyProcess.once("exit", (code) => {
+          state.proxyStarting = false;
+          state.proxyProcess = undefined;
+          shared.proxySpawnClaimedAt = 0;
+          if (code !== null && code !== 0)
+            state.lastError = `Headroom proxy exited with code ${code}`;
+        });
+        ctx?.ui?.notify?.(`Starting Headroom proxy on ${PROXY_URL}…`, "info");
+      }
     }
   }
 
@@ -2029,6 +2071,7 @@ export default function headroomExtension(pi: ExtensionAPI) {
   pi.setLabel?.("Headroom");
   let latestCtx: ExtensionContext | undefined;
   let rainbowTimer: NodeJS.Timeout | undefined;
+  let lastForeignSeen = -1;
   let widgetOnScreen = true; // updated by widget_layout event
 
   function startRainbowTimer() {
@@ -2045,20 +2088,13 @@ export default function headroomExtension(pi: ExtensionAPI) {
         state.rainbowPhase = (state.rainbowPhase + 1) % RAINBOW_CODES.length;
         dirty = true;
       }
-      // Main UI session: refresh aggregated subagent (+N) totals ~1/s. This is
-      // LOCAL file I/O and must NOT be gated on proxyReady — otherwise a busy
-      // or briefly-unreachable proxy would freeze the subagent counters.
-      if (isMainUi && now - (state.foreignReadAt || 0) > 1_000) {
-        state.foreignReadAt = now;
-        const t = readForeignTotals();
-        if (
-          t.provider !== state.foreignProvider ||
-          t.tool !== state.foreignTool ||
-          t.ccr !== state.foreignCcr
-        ) {
-          state.foreignProvider = t.provider;
-          state.foreignTool = t.tool;
-          state.foreignCcr = t.ccr;
+      // Main UI session: repaint when subagent (+N) totals move. The widget
+      // reads the process-shared counters directly (state.ts `shared`), so this
+      // is a pure compare — no I/O — and must NOT be gated on proxyReady.
+      if (isMainUi) {
+        const foreignSum = shared.foreignProvider + shared.foreignTool + shared.foreignCcr;
+        if (foreignSum !== lastForeignSeen) {
+          lastForeignSeen = foreignSum;
           dirty = true;
         }
       }
@@ -2161,7 +2197,11 @@ export default function headroomExtension(pi: ExtensionAPI) {
       // first request. The proxy persists per_project[sessionId].
       await fetchStats(state, true);
       renderWidget(ctx, state);
-    })();
+    })().catch((error) => {
+      // Guarded like refreshStatsAndRender: a host-UI exception in this
+      // fire-and-forget path must not become an unhandled rejection.
+      state.lastError = errorMessage(error);
+    });
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -2253,16 +2293,6 @@ export default function headroomExtension(pi: ExtensionAPI) {
     if (!state.enabled || compressionIsPaused()) return;
     await prepareArchiveSession(ctx, state);
     ensureMainCaptured(ctx);
-    // Main session: refresh subagent (+N) from foreign files on every provider
-    // request — the timer-based read alone is unreliable.
-    if (isMainSession(ctx)) {
-      try {
-        const t = readForeignTotals();
-        state.foreignProvider = t.provider;
-        state.foreignTool = t.tool;
-        state.foreignCcr = t.ccr;
-      } catch {}
-    }
     const payload = event.payload;
     if (!isRecord(payload) || (!Array.isArray(payload.messages) && !Array.isArray(payload.input)))
       return;

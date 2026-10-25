@@ -41,11 +41,17 @@ export function formatUsd(value: unknown): string {
 
 // Compact large widget counters: 1,234,567,890 -> "1.2B", 16,468,518 -> "16.5M".
 export function formatCompactTokens(value: unknown): string {
-  const n = Math.max(0, asNumber(value));
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return String(Math.round(n));
+  let n = Math.max(0, asNumber(value));
+  const units = ["k", "M", "B"];
+  let unit = -1;
+  // 999.95 (not 1000) so values like 999,999 roll to "1.0M" instead of
+  // printing the overflowed "1000.0k".
+  while (n >= 999.95 && unit < units.length - 1) {
+    n /= 1_000;
+    unit += 1;
+  }
+  if (unit < 0) return String(Math.round(n));
+  return `${n.toFixed(1)}${units[unit]}`;
 }
 
 export function computeInner(contentWidth = 0): number {
@@ -123,7 +129,10 @@ export function stableJson(value: unknown): string {
 export function truncateMiddle(text: string, maxChars: number): string {
   const source = text.isWellFormed() ? text : text.toWellFormed();
   if (source.length <= maxChars) return source;
-  const half = Math.max(20, Math.floor((maxChars - 40) / 2));
+  // Keep halves small enough that prefix + marker (~62 chars incl. digit
+  // slack) + suffix stays within maxChars; the old (maxChars-40)/2 formula
+  // could emit a "truncated" result LONGER than both the input and the cap.
+  const half = Math.max(1, Math.floor((maxChars - 62) / 2));
   let prefixEnd = half;
   if (
     prefixEnd < source.length &&

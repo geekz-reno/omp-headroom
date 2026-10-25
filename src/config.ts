@@ -130,13 +130,20 @@ export const SESSION_ARCHIVE_MAX_MESSAGE_CHARS = cfgNum(
   900,
 );
 
-export const PROVIDER_TIMEOUT_MS = Number(process.env.OMP_HEADROOM_TIMEOUT_MS || 12_000);
-export const TOOL_TIMEOUT_MS = Number(process.env.OMP_HEADROOM_TOOL_TIMEOUT_MS || 20_000);
+// Numeric env knobs: a non-numeric value must fall back to the default, not
+// become NaN (NaN would turn setInterval into a ~1ms storm and make
+// AbortSignal.timeout throw on every compression call).
+function envMs(envKey: string, def: number): number {
+  const n = Number(process.env[envKey]);
+  return Number.isFinite(n) && n > 0 ? n : def;
+}
+export const PROVIDER_TIMEOUT_MS = envMs("OMP_HEADROOM_TIMEOUT_MS", 12_000);
+export const TOOL_TIMEOUT_MS = envMs("OMP_HEADROOM_TOOL_TIMEOUT_MS", 20_000);
 export const ANTHROPIC_COMPRESSION_ENABLED = process.env.OMP_HEADROOM_ANTHROPIC_PROVIDER !== "off";
-export const RAINBOW_MS = Number(process.env.OMP_HEADROOM_RAINBOW_MS || 180);
+export const RAINBOW_MS = envMs("OMP_HEADROOM_RAINBOW_MS", 180);
 export const RAINBOW_CODES = [196, 202, 226, 46, 51, 39, 129, 201];
-export const READY_TTL_MS = Number(process.env.OMP_HEADROOM_READY_TTL_MS || 30_000);
-export const STATS_MIN_INTERVAL_MS = Number(process.env.OMP_HEADROOM_STATS_INTERVAL_MS || 2_500);
+export const READY_TTL_MS = envMs("OMP_HEADROOM_READY_TTL_MS", 30_000);
+export const STATS_MIN_INTERVAL_MS = envMs("OMP_HEADROOM_STATS_INTERVAL_MS", 2_500);
 /// Backoff schedule (ms) for the proxy connect-with-retry loop. Each entry is
 /// the wait BEFORE the next attempt; total window is the sum (~135s) so a slow
 /// cold-start (heavy ML model load on a small box) has room to warm up before
@@ -155,9 +162,7 @@ export const ARCHIVE_STATS_DIR = cfgStr(
 );
 export const VENV_PYTHON = join(VENV_DIR, "bin", "python");
 export const AUTOUPDATE = process.env.OMP_HEADROOM_AUTOUPDATE !== "0";
-export const UPDATE_INTERVAL_MS = Number(
-  process.env.OMP_HEADROOM_UPDATE_INTERVAL_MS || 24 * 3_600_000,
-);
+export const UPDATE_INTERVAL_MS = envMs("OMP_HEADROOM_UPDATE_INTERVAL_MS", 24 * 3_600_000);
 const EXTRAS = process.env.OMP_HEADROOM_EXTRAS ?? "all";
 export const PACKAGE_SPEC = EXTRAS ? `headroom-ai[${EXTRAS}]` : "headroom-ai";
 export const UPDATE_STATE_FILE = join(dirname(VENV_DIR), ".headroom-update.json");
@@ -392,12 +397,33 @@ export function parseSettingValue(
  * keys — including unknown ones — are preserved verbatim. The in-memory
  * constants are computed at import, so a change takes effect on the next
  * session or /reload-plugins.
+ *
+ * Refuses to write when the existing file cannot be parsed as a YAML mapping:
+ * loadHeadroomConfig deliberately swallows parse errors for the read path,
+ * and writing through that fallback would silently replace the whole file
+ * (every other key) with the single new key.
  */
 export async function saveHeadroomConfigKey(
   key: string,
   value: string | number | boolean,
   path = HEADROOM_CONFIG_PATH,
 ): Promise<void> {
+  if (existsSync(path)) {
+    try {
+      const text = readFileSync(path, "utf8");
+      if (text.trim()) {
+        const parsed = Bun.YAML.parse(text);
+        if (parsed !== null && (typeof parsed !== "object" || Array.isArray(parsed))) {
+          throw new Error("its root is not a YAML mapping");
+        }
+      }
+    } catch (error) {
+      const reason = error instanceof Error && error.message ? error.message : String(error);
+      throw new Error(
+        `${path} is malformed (${reason}); fix or remove the file before /headroom set so its other keys are not lost`,
+      );
+    }
+  }
   const root = loadHeadroomConfig(path);
   root[key] = value;
   const directory = dirname(path);

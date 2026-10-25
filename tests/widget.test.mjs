@@ -93,3 +93,14 @@ describe("provider prompt cache formatting", () => {
     expect(cacheRows[0]).toContain("cache 72% · read 72 · write 12");
   });
 });
+
+describe("formatCompactTokens", () => {
+  test("rolls 999,999 to the next unit instead of overflowing", async () => {
+    const { formatCompactTokens } = await import("../src/util.ts");
+    expect(formatCompactTokens(999_949)).toBe("999.9k");
+    expect(formatCompactTokens(999_999)).toBe("1.0M");
+    expect(formatCompactTokens(1_234_567_890)).toBe("1.2B");
+    expect(formatCompactTokens(999_999_999)).toBe("1.0B");
+    expect(formatCompactTokens(500)).toBe("500");
+  });
+});

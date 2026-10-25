@@ -368,11 +368,14 @@ describe("archive boundary safety", () => {
   });
 
   test("keeps the suffix boundary on a complete astral character", () => {
-    const splitPair = `${"a".repeat(199)}😀${"b".repeat(39)}`;
+    // The suffix half for maxChars=120 is 29, so the boundary lands at
+    // length-29; the astral pair straddles it and must be kept whole.
+    const splitPair = `${"a".repeat(210)}😀${"b".repeat(28)}`;
     const result = truncateMiddle(splitPair, 120);
 
     expect(result.isWellFormed()).toBe(true);
-    expect(result).toEndWith(`😀${"b".repeat(39)}`);
+    expect(result).toEndWith(`😀${"b".repeat(28)}`);
+    expect(result.length).toBeLessThanOrEqual(120);
   });
 
   test("never leaves an OpenAI Responses function call without its matching output", () => {

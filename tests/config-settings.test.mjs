@@ -101,6 +101,36 @@ test("saveHeadroomConfigKey creates the file when absent", async () => {
   expect(loadHeadroomConfig(path).session_live_messages).toBe(32);
 });
 
+test("saveHeadroomConfigKey refuses to overwrite a malformed file", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headroom-config-broken-"));
+  const path = join(dir, "headroom.yml");
+  writeFileSync(path, "min_tool_chars: 12000\n  bad_indent: [", "utf8");
+  let rejected;
+  try {
+    await saveHeadroomConfigKey("debug_sizing", false, path);
+  } catch (error) {
+    rejected = error;
+  }
+  expect(rejected).toBeInstanceOf(Error);
+  expect(String(rejected.message)).toContain("malformed");
+  // The unparseable file must be left byte-identical, not rewritten.
+  expect(readFileSync(path, "utf8")).toBe("min_tool_chars: 12000\n  bad_indent: [");
+});
+
+test("saveHeadroomConfigKey refuses to overwrite a non-mapping root", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headroom-config-list-"));
+  const path = join(dir, "headroom.yml");
+  writeFileSync(path, "- just\n- a\n- list\n", "utf8");
+  let rejected;
+  try {
+    await saveHeadroomConfigKey("debug_sizing", false, path);
+  } catch (error) {
+    rejected = error;
+  }
+  expect(rejected).toBeInstanceOf(Error);
+  expect(readFileSync(path, "utf8")).toBe("- just\n- a\n- list\n");
+});
+
 test("set completion offers keys, then values for booleans only", () => {
   const keys = completeHeadroomCommand("set ", []);
   expect(keys?.some((entry) => entry.label === "anthropic_min_tool_chars")).toBe(true);

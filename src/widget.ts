@@ -131,8 +131,8 @@ export function renderWidget(ctx: HeadroomCtx, state: HeadroomState): void {
     const total = CONNECT_BACKOFF_MS.length;
     problem = state.connectAttempt ? `connecting ${state.connectAttempt}/${total}…` : "starting…";
   } else if (!state.proxyReady) problem = clip(state.lastError || "offline", 28);
-  const topLeftRaw = `─ Headroom ${problem ? `· ${problem} ` : ""}`;
-  const topLeftStyled = `─ ${titleStyled} ${problem ? `${color(state.enabled ? 33 : 90, `· ${problem}`)} ` : ""}`;
+  let topLeftRaw = `─ Headroom ${problem ? `· ${problem} ` : ""}`;
+  let topLeftStyled = `─ ${titleStyled} ${problem ? `${color(state.enabled ? 33 : 90, `· ${problem}`)} ` : ""}`;
   const sid = String(state.sessionId || "").slice(0, 8);
   let topRightRaw = sid ? ` ${sid} ─` : "";
   let topRightStyled = sid ? ` ${color(90, sid)} ─` : "";
@@ -164,6 +164,13 @@ export function renderWidget(ctx: HeadroomCtx, state: HeadroomState): void {
   );
   // Narrow caps: the right border segments are decoration — drop them before
   // letting a border row overflow the box width.
+  if (topLeftRaw.length + 1 > inner) {
+    // The left segment alone (long `problem` text) can also overflow: clip the
+    // problem to what fits next to the title inside the narrowed box.
+    problem = clip(problem, Math.max(0, inner - 14));
+    topLeftRaw = `─ Headroom ${problem ? `· ${problem} ` : ""}`;
+    topLeftStyled = `─ ${titleStyled} ${problem ? `${color(state.enabled ? 33 : 90, `· ${problem}`)} ` : ""}`;
+  }
   if (topLeftRaw.length + topRightRaw.length + 1 > inner) {
     topRightRaw = "";
     topRightStyled = "";

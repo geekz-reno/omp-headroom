@@ -58,9 +58,11 @@ function messageApproxChars(message: unknown): number {
   if (!isRecord(message)) return String(message ?? "").length;
   const texts: string[] = [];
   collectProviderTextCandidates(message, texts);
+  // Plain JSON.stringify: stableJson only reorders keys, so the serialized
+  // LENGTH is identical and the native serializer is several times faster.
   return Math.max(
     texts.reduce((sum, text) => sum + text.length, 0),
-    stableJson(message).length,
+    JSON.stringify(message).length,
   );
 }
 
@@ -279,8 +281,12 @@ export function createSessionCompaction(
   if (!prefix.every(isTextOnlyArchiveMessage)) {
     return passThrough(messages, "unsupported_prefix_content");
   }
-  const prefixChars = prefix.reduce<number>((sum, message) => sum + messageApproxChars(message), 0);
-  const totalChars = body.reduce<number>((sum, message) => sum + messageApproxChars(message), 0);
+  // One approx pass over the body serves both sums (the prefix is body[0..cut)),
+  // instead of re-walking the prefix a second time.
+  const bodyApprox = body.map(messageApproxChars);
+  const totalChars = bodyApprox.reduce((sum, chars) => sum + chars, 0);
+  let prefixChars = 0;
+  for (let index = 0; index < cut; index++) prefixChars += bodyApprox[index];
   const minPrefixChars = Math.max(0, Number(options.minPrefixChars ?? SESSION_PREFIX_MIN_CHARS));
   const minPrefixShare = Math.max(0, Number(options.minPrefixShare ?? SESSION_PREFIX_MIN_SHARE));
   const prefixShare = totalChars > 0 ? prefixChars / totalChars : 0;
